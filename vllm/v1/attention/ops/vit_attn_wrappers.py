@@ -198,11 +198,15 @@ def apply_sdpa(
     Input shape:
     (batch_size x seq_len x num_heads x head_size)
     """
-    q, k, v = (einops.rearrange(x, "b s h d -> b h s d") for x in [q, k, v])
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    # q, k, v = (einops.rearrange(x, "b s h d -> b h s d") for x in [q, k, v])
     output = F.scaled_dot_product_attention(
         q, k, v, dropout_p=0.0, scale=scale, enable_gqa=enable_gqa
     )
-    output = einops.rearrange(output, "b h s d -> b s h d ")
+    output = output.transpose(1, 2)
+    # output = einops.rearrange(output, "b h s d -> b s h d ")
     return output
 
 
@@ -243,8 +247,8 @@ def torch_sdpa_wrapper_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    scale: float | None,
-    cu_seqlens: torch.Tensor | None,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     enable_gqa: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(q)

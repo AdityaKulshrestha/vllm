@@ -298,7 +298,9 @@ def _try_load_aot_compiled_fn(
             # Eagerly load compiled artifacts now that traced_files
             # is populated by _verify_source_unchanged.
             with maybe_use_cudagraph_partition_wrapper(model.vllm_config):
-                loaded_fn._artifacts.compiled_fn.finalize_loading(model.vllm_config)
+                compiled_fn = loaded_fn._artifacts.compiled_fn
+                if hasattr(compiled_fn, 'finalize_loading'):
+                    compiled_fn.finalize_loading(model.vllm_config)
             compilation_counter.num_aot_artifacts_loaded += 1
             logger.info(
                 "Directly load AOT compilation from path %s", aot_compilation_path

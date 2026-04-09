@@ -256,6 +256,7 @@ def dispatch_cpu_unquantized_gemm(
         return
 
     if envs.VLLM_CPU_SGL_KERNEL and check_cpu_sgl_kernel(N, K, dtype):
+        # TODO: What exactly it it doing in weight prepacking
         packed_weight = torch.ops._C.convert_weight_packed(layer.weight)
         if getattr(layer, "bias", None) is not None:
             bias_f32 = layer.bias.to(torch.float32)

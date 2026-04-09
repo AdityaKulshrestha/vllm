@@ -775,11 +775,10 @@ def cast_overflow_tensors(
     tensors: torch.Tensor,
     offset: float = 1000,
 ) -> torch.Tensor:
-    if tensors.isinf().any() or tensors.isnan().any():
-        clamp_value = torch.finfo(tensors.dtype).max - offset
-        tensors = torch.clamp(tensors, min=-clamp_value, max=clamp_value)
+    if tensors.dtype in (torch.float16, torch.bfloat16):
+        finfo = torch.finfo(tensors.dtype)
+        tensors = tensors.clamp(min=finfo.min, max=finfo.max)
     return tensors
-
 
 def fast_topk(
     values: torch.Tensor, topk: int, dim: int

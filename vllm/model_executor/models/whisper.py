@@ -241,12 +241,40 @@ class WhisperAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ):
+        # TODO 2:  - Change the 3D dimension to 2D and check if it works with the attention implementation. If not, we can add a separate attention implementation for 2D inputs.
+        original_dim = hidden_states.dim()
+        original_shape = hidden_states.shape
+        if original_dim == 3:
+            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1)).contiguous()
+            # hidden_states = hidden_states.squeeze(0)
         qkv, _ = self.qkv_proj(hidden_states)
+
+        if original_dim == 3:
+            qkv = qkv.reshape(
+                *original_shape[:-1], qkv.size(-1)
+            ).contiguous()
+            # qkv = qkv.unsqueeze(0)
+        
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         attn_output = self.attn(q, k, v)
 
+        original_dim = attn_output.dim()
+        original_shape = attn_output.shape
+
+        if original_dim == 3:
+            attn_output = attn_output.reshape(
+                -1, attn_output.size(-1)
+            ).contiguous()
+            # attn_output = attn_output.squeeze(0)
+
         output, _ = self.out_proj(attn_output)
+
+        if original_dim == 3:
+            output = output.reshape(
+                *original_shape[:-1], output.size(-1)
+            ).contiguous()
+            # output = output.unsqueeze(0)
 
         return output
 
@@ -344,9 +372,28 @@ class WhisperMLP(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor):
+        # TODO: Change 2 - Changing the 3D dimension to 2D
+        # if hidden_states.dim() == 3:
+            # hidden_states = hidden_states.squeeze(0)
+        original_dim = hidden_states.dim()
+        original_shape = hidden_states.shape
+        if original_dim == 3:
+            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1)).contiguous()
         hidden_states, _ = self.fc1(hidden_states)
+        if original_dim == 3:
+            hidden_states = hidden_states.reshape(
+                *original_shape[:-1], hidden_states.size(-1)
+            ).contiguous()
+            # hidden_states = hidden_states.unsqueeze(0)
         hidden_states = self.activation_fn(hidden_states)
+        if original_dim == 3:
+            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1)).contiguous()
         hidden_states, _ = self.fc2(hidden_states)
+        if original_dim == 3:
+            hidden_states = hidden_states.reshape(
+                *original_shape[:-1], hidden_states.size(-1)
+            ).contiguous()
+            # hidden_states = hidden_states.unsqueeze(0)
         return hidden_states
 
 
@@ -391,6 +438,7 @@ class WhisperEncoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
+        # TODO: 4 Issue 1 - Data dependent dynamic control flow
         hidden_states = cast_overflow_tensors(hidden_states)
 
         return hidden_states
@@ -454,7 +502,16 @@ class WhisperDecoderLayer(nn.Module):
 
         return hidden_states
 
+# def whisper_encoder_invariants(input_features, **kwargs):
+    # Encoder input is always (batch, 128, 3000)
+    # torch._check(input_features.size(1) == 128)
+    # torch._check(input_features.size(2) == 3000)
 
+# @support_torch_compile(
+#     dynamic_arg_dims={"input_features": 0},
+#     # shape_invariants=whisper_encoder_invariants,
+#     enable_if=lambda cfg: cfg.model_config.is_encoder_decoder,
+# )
 class WhisperEncoder(nn.Module):
     def __init__(
         self, *, vllm_config: VllmConfig, prefix: str = "", init_in_fp32: bool = False
@@ -510,6 +567,7 @@ class WhisperEncoder(nn.Module):
     ) -> torch.Tensor:
         hidden_states = []
         input_is_batched = False
+        # TODO: THIS IS WHERE WE ENCODE USING CONV LAYERS. CHECK IF THIS IS A BOTTLENECK AND OPTIMIZE IF NEEDED.
         for features in input_features:
             embeds = nn.functional.gelu(self.conv1(features))
             embeds = nn.functional.gelu(self.conv2(embeds))
@@ -527,6 +585,13 @@ class WhisperEncoder(nn.Module):
             hidden_states = torch.cat(hidden_states)
         else:
             hidden_states = torch.stack(hidden_states, dim=0)
+
+        # embeds = nn.functional.gelu(self.conv1(input_features))
+        # embeds = nn.functional.gelu(self.conv2(embeds))
+        # embeds = embeds.transpose(-1, -2)
+        # seq_len = embeds.size(-2)
+        # pos = self.embed_positions.weight[:seq_len, :]
+        # embeds = (embeds + pos).to(embeds.dtype)
 
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(hidden_states)
@@ -1007,6 +1072,10 @@ class WhisperForConditionalGeneration(
 
     def _parse_and_validate_audio_input(self, **kwargs: object) -> WhisperAudioInputs:
         input_features = kwargs.pop("input_features", None)
+
+        # TODO 1: Making the shape compatible with the operation
+        if input_features.dim() == 3 and input_features.size(1) == 80:
+            input_features = input_features[:, :, :2976]
 
         if input_features is not None:
             input_features = json_map_leaves(lambda x: x.to(self.dtype), input_features)
