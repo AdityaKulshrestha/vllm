@@ -86,6 +86,10 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+#TODO: Remove later:
+torch._dynamo.config.reorderable_logging_functions.add(print)
+
+
 class WhisperPosEmbedType(enum.Enum):
     SINUSOIDAL = "sinusoidal"
     ROPE = "rope"
@@ -396,7 +400,13 @@ class WhisperMLP(nn.Module):
             # hidden_states = hidden_states.unsqueeze(0)
         return hidden_states
 
-
+# Compiling at the layer level
+@support_torch_compile(
+    dynamic_arg_dims={"hidden_states": 0},
+    # shape_invariants=whisper_encoder_invariants,
+    is_encoder=True,
+    enable_if=lambda cfg: cfg.model_config.is_encoder_decoder,
+)
 class WhisperEncoderLayer(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -430,6 +440,7 @@ class WhisperEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
     ):
         residual = hidden_states
+        print(f"ENCODER INPUT STATES: {hidden_states.shape}")
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(hidden_states=hidden_states)
         hidden_states = residual + hidden_states
@@ -510,6 +521,7 @@ class WhisperDecoderLayer(nn.Module):
 # @support_torch_compile(
 #     dynamic_arg_dims={"input_features": 0},
 #     # shape_invariants=whisper_encoder_invariants,
+#     is_encoder=True,
 #     enable_if=lambda cfg: cfg.model_config.is_encoder_decoder,
 # )
 class WhisperEncoder(nn.Module):
@@ -568,6 +580,8 @@ class WhisperEncoder(nn.Module):
         hidden_states = []
         input_is_batched = False
         # TODO: THIS IS WHERE WE ENCODE USING CONV LAYERS. CHECK IF THIS IS A BOTTLENECK AND OPTIMIZE IF NEEDED.
+        # Removed for loop and data dependent flow to support torch compile
+        print(f"This is the input data: {len(input_features)}")
         for features in input_features:
             embeds = nn.functional.gelu(self.conv1(features))
             embeds = nn.functional.gelu(self.conv2(embeds))
@@ -579,23 +593,35 @@ class WhisperEncoder(nn.Module):
 
             hidden_states.append(embeds)
             input_is_batched = embeds.ndim > 2
+            print(f"Generating embed: {embeds.shape}")
+
         # Input to MHA must be B x T x D
+
         if input_is_batched:
             # Models using WhisperEncoder may handle batching internally.
             hidden_states = torch.cat(hidden_states)
         else:
             hidden_states = torch.stack(hidden_states, dim=0)
 
+        # Torch compile friendly
+        # B x C x T
+        # if isinstance(input_features, list):
+        #     input_features = torch.stack(input_features, dim=0)
+
+        # # Conv + GELU 
         # embeds = nn.functional.gelu(self.conv1(input_features))
         # embeds = nn.functional.gelu(self.conv2(embeds))
-        # embeds = embeds.transpose(-1, -2)
-        # seq_len = embeds.size(-2)
-        # pos = self.embed_positions.weight[:seq_len, :]
-        # embeds = (embeds + pos).to(embeds.dtype)
+        # embeds = embeds.transpose(-1, -2).contiguous()
+
+        # # Positional embeddings
+        # seq_len = embeds.size(1)
+        # hidden_states = (embeds + self.embed_positions.weight[:seq_len, :]).to(embeds.dtype)
+
 
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(hidden_states)
 
+        print(f"Output Shape: {hidden_states.shape}")
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states
 
@@ -1074,8 +1100,8 @@ class WhisperForConditionalGeneration(
         input_features = kwargs.pop("input_features", None)
 
         # TODO 1: Making the shape compatible with the operation
-        if input_features.dim() == 3 and input_features.size(1) == 80:
-            input_features = input_features[:, :, :2976]
+        # if input_features.dim() == 3 and input_features.size(1) == 80:
+            # input_features = input_features[:, :, :2976]
 
         if input_features is not None:
             input_features = json_map_leaves(lambda x: x.to(self.dtype), input_features)
