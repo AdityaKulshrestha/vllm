@@ -3,9 +3,10 @@
 
 import enum
 import math
+import weakref
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import nullcontext
-from typing import Annotated
+from typing import Annotated, Literal
 
 import numpy as np
 import torch
@@ -20,7 +21,6 @@ from transformers.models.whisper.modeling_whisper import sinusoids
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, SpeechToTextConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
-from vllm.config.speech_to_text import SpeechToTextParams
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.inputs import (
     ExplicitEncoderDecoderPrompt,
@@ -87,8 +87,8 @@ from .utils import (
 logger = init_logger(__name__)
 
 
-#TODO: Remove later:
-torch._dynamo.config.reorderable_logging_functions.add(print)
+#TODO: Remove later
+# torch._dynamo.config.reorderable_logging_functions.add(print)
 
 
 class WhisperPosEmbedType(enum.Enum):
@@ -247,39 +247,25 @@ class WhisperAttention(nn.Module):
         hidden_states: torch.Tensor,
     ):
         # TODO 2:  - Change the 3D dimension to 2D and check if it works with the attention implementation. If not, we can add a separate attention implementation for 2D inputs.
-        original_dim = hidden_states.dim()
         original_shape = hidden_states.shape
-        if original_dim == 3:
-            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1)).contiguous()
-            # hidden_states = hidden_states.squeeze(0)
-        qkv, _ = self.qkv_proj(hidden_states)
+        # Assume 3D input [batch, seq_len, hidden_dim] - use zero-copy view
+        hidden_states = hidden_states.view(-1, hidden_states.size(-1))
 
-        if original_dim == 3:
-            qkv = qkv.reshape(
-                *original_shape[:-1], qkv.size(-1)
-            ).contiguous()
-            # qkv = qkv.unsqueeze(0)
-        
+        qkv, _ = self.qkv_proj(hidden_states)
+        # Restore original shape
+        qkv = qkv.view(*original_shape[:-1], qkv.size(-1))
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         attn_output = self.attn(q, k, v)
 
-        original_dim = attn_output.dim()
         original_shape = attn_output.shape
-
-        if original_dim == 3:
-            attn_output = attn_output.reshape(
-                -1, attn_output.size(-1)
-            ).contiguous()
-            # attn_output = attn_output.squeeze(0)
+        # Flatten for output projection
+        attn_output = attn_output.view(-1, attn_output.size(-1))
 
         output, _ = self.out_proj(attn_output)
-
-        if original_dim == 3:
-            output = output.reshape(
-                *original_shape[:-1], output.size(-1)
-            ).contiguous()
-            # output = output.unsqueeze(0)
+        # Restore shape
+        output = output.view(*original_shape[:-1], output.size(-1))
 
         return output
 
@@ -339,7 +325,9 @@ class WhisperCrossAttention(WhisperAttention):
         # Encoder hidden states are only computed once during prefill phase.
         # Afterwards, the keys and values should be available in the kv-cache.
         if encoder_hidden_states is not None:
+            encoder_hidden_states = encoder_hidden_states.view(-1, encoder_hidden_states.size(-1))
             kv, _ = self.kv_proj(encoder_hidden_states)
+            kv = kv.view(*encoder_hidden_states.shape[:-1], kv.size(-1))
             k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
         else:
             k = v = None
@@ -377,37 +365,47 @@ class WhisperMLP(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor):
-        # TODO: Change 2 - Changing the 3D dimension to 2D
-        # if hidden_states.dim() == 3:
-            # hidden_states = hidden_states.squeeze(0)
-        original_dim = hidden_states.dim()
         original_shape = hidden_states.shape
-        if original_dim == 3:
-            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1)).contiguous()
+        # Assume 3D input [batch, seq_len, hidden_dim] - use zero-copy view
+        hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+
         hidden_states, _ = self.fc1(hidden_states)
-        if original_dim == 3:
-            hidden_states = hidden_states.reshape(
-                *original_shape[:-1], hidden_states.size(-1)
-            ).contiguous()
-            # hidden_states = hidden_states.unsqueeze(0)
+        # Restore shape for activation
+        hidden_states = hidden_states.view(*original_shape[:-1], hidden_states.size(-1))
+
         hidden_states = self.activation_fn(hidden_states)
-        if original_dim == 3:
-            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1)).contiguous()
+
+        # Flatten for fc2
+        hidden_states = hidden_states.view(-1, hidden_states.size(-1))
         hidden_states, _ = self.fc2(hidden_states)
-        if original_dim == 3:
-            hidden_states = hidden_states.reshape(
-                *original_shape[:-1], hidden_states.size(-1)
-            ).contiguous()
-            # hidden_states = hidden_states.unsqueeze(0)
+
+        # Restore original shape
+        hidden_states = hidden_states.view(*original_shape[:-1], hidden_states.size(-1))
+
         return hidden_states
 
 # Compiling at the layer level
-@support_torch_compile(
-    dynamic_arg_dims={"hidden_states": 0},
-    # shape_invariants=whisper_encoder_invariants,
-    is_encoder=True,
-    enable_if=lambda cfg: cfg.model_config.is_encoder_decoder,
-)
+# def whisper_encoder_invariants(hidden_states):
+#     """Shape invariants for Whisper encoder compilation.
+
+#     Encoder input after preprocessing is always:
+#     - Dimension 2 (dimension): 1024
+#     - Dimension 1 (seq steps): 1500 for 30s audio
+#     - Dimension 0 (batch): dynamic
+#     """
+#     # Check that mel bins dimension is valid (80 or 128 typical)
+#     torch._check(hidden_states.size(1) == 1500)
+
+#     # Time dimension should be 3000 for standard 30s Whisper audio
+#     torch._check(hidden_states.size(2) == 1024)
+
+
+# @support_torch_compile(
+#     dynamic_arg_dims={"hidden_states": 0},  # Batch dimension is dynamic
+#     shape_invariants=whisper_encoder_invariants,
+#     is_encoder=True,
+#     enable_if=lambda cfg: cfg.model_config.is_encoder_decoder,
+# )
 class WhisperEncoderLayer(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -441,7 +439,6 @@ class WhisperEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
     ):
         residual = hidden_states
-        print(f"ENCODER INPUT STATES: {hidden_states.shape}")
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(hidden_states=hidden_states)
         hidden_states = residual + hidden_states
@@ -451,7 +448,8 @@ class WhisperEncoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         # TODO: 4 Issue 1 - Data dependent dynamic control flow
-        hidden_states = cast_overflow_tensors(hidden_states)
+        # Removed cast_overflow_tensors to enable torch.compile support
+        # hidden_states = cast_overflow_tensors(hidden_states)
 
         return hidden_states
 
@@ -514,17 +512,28 @@ class WhisperDecoderLayer(nn.Module):
 
         return hidden_states
 
-# def whisper_encoder_invariants(input_features, **kwargs):
-    # Encoder input is always (batch, 128, 3000)
-    # torch._check(input_features.size(1) == 128)
-    # torch._check(input_features.size(2) == 3000)
+def whisper_encoder_invariants(input_features):
+    """Shape invariants for Whisper encoder compilation.
 
-# @support_torch_compile(
-#     dynamic_arg_dims={"input_features": 0},
-#     # shape_invariants=whisper_encoder_invariants,
-#     is_encoder=True,
-#     enable_if=lambda cfg: cfg.model_config.is_encoder_decoder,
-# )
+    Encoder input after preprocessing is always:
+    - Dimension 1 (num_mel_bins): 80 or 128 depending on model
+    - Dimension 2 (time frames): 3000 for 30s audio
+    - Dimension 0 (batch): dynamic
+    """
+    # Check that mel bins dimension is valid (80 or 128 typical)
+    torch._check(input_features.size(1) >= 80)
+    torch._check(input_features.size(1) <= 128)
+
+    # Time dimension should be 3000 for standard 30s Whisper audio
+    torch._check(input_features.size(2) == 3000)
+
+
+@support_torch_compile(
+    dynamic_arg_dims={"input_features": 0},  # Batch dimension is dynamic
+    shape_invariants=whisper_encoder_invariants,
+    is_encoder=True,
+    enable_if=lambda cfg: cfg.model_config.is_encoder_decoder,
+)
 class WhisperEncoder(nn.Module):
     def __init__(
         self, *, vllm_config: VllmConfig, prefix: str = "", init_in_fp32: bool = False
@@ -575,54 +584,32 @@ class WhisperEncoder(nn.Module):
                 sinusoids(*self.embed_positions.weight.shape)
             )
 
-    def forward(
-        self, input_features: torch.Tensor | list[torch.Tensor]
-    ) -> torch.Tensor:
-        hidden_states = []
-        input_is_batched = False
-        # TODO: THIS IS WHERE WE ENCODE USING CONV LAYERS. CHECK IF THIS IS A BOTTLENECK AND OPTIMIZE IF NEEDED.
-        # Removed for loop and data dependent flow to support torch compile
-        print(f"This is the input data: {len(input_features)}")
-        for features in input_features:
-            embeds = nn.functional.gelu(self.conv1(features))
-            embeds = nn.functional.gelu(self.conv2(embeds))
+    def forward(self, input_features: torch.Tensor) -> torch.Tensor:
+        """
+        Encoder forward pass - always receives a batched tensor.
 
-            embeds = embeds.transpose(-1, -2)
-            embeds = (embeds + self.embed_positions.weight[: embeds.size(-2), :]).to(
-                embeds.dtype
-            )
+        List-to-tensor conversion happens in get_encoder_outputs() before calling this.
 
-            hidden_states.append(embeds)
-            input_is_batched = embeds.ndim > 2
-            print(f"Generating embed: {embeds.shape}")
+        Args:
+            input_features: [batch, num_mel_bins, time_frames] e.g. [B, 80, 3000]
 
-        # Input to MHA must be B x T x D
+        Returns:
+            encoded_states: [batch, seq_len, hidden_dim] e.g. [B, 1500, 768]
+        """
+        # Conv + GELU: [B, 80, 3000] -> [B, 768, 1500]
+        embeds = nn.functional.gelu(self.conv1(input_features))
+        embeds = nn.functional.gelu(self.conv2(embeds))
 
-        if input_is_batched:
-            # Models using WhisperEncoder may handle batching internally.
-            hidden_states = torch.cat(hidden_states)
-        else:
-            hidden_states = torch.stack(hidden_states, dim=0)
+        # Transpose for transformer: [B, 768, 1500] -> [B, 1500, 768]
+        embeds = embeds.transpose(-1, -2).contiguous()
 
-        # Torch compile friendly
-        # B x C x T
-        # if isinstance(input_features, list):
-        #     input_features = torch.stack(input_features, dim=0)
-
-        # # Conv + GELU 
-        # embeds = nn.functional.gelu(self.conv1(input_features))
-        # embeds = nn.functional.gelu(self.conv2(embeds))
-        # embeds = embeds.transpose(-1, -2).contiguous()
-
-        # # Positional embeddings
-        # seq_len = embeds.size(1)
-        # hidden_states = (embeds + self.embed_positions.weight[:seq_len, :]).to(embeds.dtype)
-
+        # Positional embeddings
+        seq_len = embeds.size(1)
+        hidden_states = (embeds + self.embed_positions.weight[:seq_len, :]).to(embeds.dtype)
 
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(hidden_states)
 
-        print(f"Output Shape: {hidden_states.shape}")
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states
 
@@ -692,7 +679,16 @@ class WhisperModel(nn.Module):
         positions: torch.Tensor,
         encoder_outputs: list[torch.Tensor],
     ) -> torch.Tensor:
-        enc_states = torch.cat(encoder_outputs, dim=0) if len(encoder_outputs) else None
+        # Use cached encoder states if available (decode path), otherwise reconstruct (fallback)
+        enc_states = None
+        if hasattr(self, 'parent_model'):
+            parent = self.parent_model()  # Dereference weak reference
+            if parent is not None and parent._cached_encoder_states is not None:
+                enc_states = parent._cached_encoder_states
+
+        if enc_states is None:
+            enc_states = torch.cat(encoder_outputs, dim=0).contiguous() if len(encoder_outputs) else None
+
         decoder_outputs = self.decoder(
             input_ids=input_ids,
             positions=positions,
@@ -706,7 +702,14 @@ class WhisperModel(nn.Module):
     ) -> torch.Tensor | None:
         if input_features is None:
             return None
-        return self.encoder(input_features)
+
+        # Convert list to batched tensor if needed
+        if isinstance(input_features, list):
+            input_features = torch.cat(input_features, dim=0)
+
+        result = self.encoder.forward(input_features)
+
+        return result
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -922,14 +925,14 @@ class WhisperForConditionalGeneration(
     @classmethod
     def get_generation_prompt(
         cls,
-        stt_params: SpeechToTextParams,
+        audio: np.ndarray,
+        model_config: ModelConfig,  # not needed here
+        stt_config: SpeechToTextConfig,
+        language: str | None,
+        task_type: Literal["transcribe", "translate"],
+        request_prompt: str,
+        to_language: str | None,
     ) -> PromptType:
-        audio = stt_params.audio
-        stt_config = stt_params.stt_config
-        language = stt_params.language
-        task_type = stt_params.task_type
-        request_prompt = stt_params.request_prompt
-
         if language is None:
             raise ValueError(
                 "Language must be specified when creating the Whisper prompt"
@@ -1052,6 +1055,9 @@ class WhisperForConditionalGeneration(
         ):
             self.model = WhisperModel(vllm_config=vllm_config, prefix=prefix)
 
+        # Link model to parent for encoder cache access (using weakref to avoid circular reference)
+        self.model.parent_model = weakref.ref(self)
+
         self.proj_out = ParallelLMHead(
             config.vocab_size,
             config.d_model,
@@ -1061,6 +1067,9 @@ class WhisperForConditionalGeneration(
         self.proj_out = self.proj_out.tie_weights(self.model.decoder.embed_tokens)
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config.vocab_size, scale=logit_scale)
+
+        # Cache for encoder output to avoid repeated cat operations during decode
+        self._cached_encoder_states: torch.Tensor | None = None
 
     def forward(
         self,
@@ -1081,10 +1090,17 @@ class WhisperForConditionalGeneration(
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         # Required as part of SupportsMultiModal interface.
         audio_input = self._parse_and_validate_audio_input(**kwargs)
-        # Split concatenated encoder outputs into one tensor per audio input
-        enc_output = self.model.get_encoder_outputs(audio_input["input_features"])
-        # The assumption is we can only process whole mm items (audios)
-        return enc_output.unbind(dim=0)
+
+        input_features = audio_input["input_features"]
+        # get_encoder_outputs now handles batching internally and returns [B, seq_len, hidden_dim]
+        enc_output = self.model.get_encoder_outputs(input_features)
+
+        # Cache encoder output to avoid repeated cat operations during decode
+        self._cached_encoder_states = enc_output
+        # Split batch dimension: [B, seq_len, hidden_dim] -> B x [seq_len, hidden_dim]
+        result = enc_output.unbind(dim=0)
+
+        return result
 
     def embed_input_ids(
         self,
